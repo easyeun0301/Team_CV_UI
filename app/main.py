@@ -9,6 +9,18 @@ import subprocess
 import os
 import atexit
 from collections import deque
+import argparse
+
+# 명령행 인자 파싱 함수 추가
+def parse_args():
+    """명령행 인자 파싱"""
+    parser = argparse.ArgumentParser(description="Dual Pose Analysis Streamlit App")
+    parser.add_argument("--port", type=int, default=8081, 
+                       help="Side view 서버 포트 (기본값: 8081)")
+    
+    # Streamlit이 실행될 때 추가되는 인자들 무시
+    args, unknown = parser.parse_known_args()
+    return args
 
 # 상위 디렉토리에서 모듈 import
 import sys
@@ -18,6 +30,53 @@ from front_view.front_view_utils import FrontViewAnalyzer
 
 # 전역 스트림 매니저 (종료시 통계 출력용)
 _global_stream_manager = None
+
+def auto_start_side_server(port=8081):
+    """Streamlit 시작시 자동으로 side_view 서버 시작 (동적 포트)"""
+    try:
+        # 이미 서버가 실행중인지 확인
+        response = requests.get(f"http://localhost:{port}/android/status", timeout=1)
+        if response.status_code == 200:
+            print(f"Side view 서버가 이미 포트 {port}에서 실행 중입니다.", flush=True)
+            return True
+    except:
+        pass
+    
+    # 서버가 없으면 새로 시작
+    try:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        side_view_path = os.path.join(current_dir, '..', 'side_view', 'run.py')
+        
+        if os.path.exists(side_view_path):
+            print(f"Side view 서버를 포트 {port}에서 시작하고 있습니다...", flush=True)
+            
+            # 백그라운드에서 서버 시작
+            process = subprocess.Popen([
+                sys.executable, side_view_path,
+                '--host', '0.0.0.0',
+                '--port', str(port)
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            # 서버 시작 확인 (최대 10초 대기)
+            for i in range(10):
+                time.sleep(1)
+                try:
+                    response = requests.get(f"http://localhost:{port}/android/status", timeout=1)
+                    if response.status_code == 200:
+                        print(f"Side view 서버가 포트 {port}에서 성공적으로 시작되었습니다!", flush=True)
+                        return True
+                except:
+                    continue
+            
+            print("Side view 서버 시작 실패 - 수동으로 시작하세요", flush=True)
+            return False
+        else:
+            print(f"side_view/run.py 파일을 찾을 수 없습니다: {side_view_path}", flush=True)
+            return False
+            
+    except Exception as e:
+        print(f"Side view 서버 자동 시작 실패: {e}", flush=True)
+        return False
 
 def print_stats_on_exit():
     """프로그램 종료시 통계 출력"""
@@ -67,7 +126,7 @@ atexit.register(print_stats_on_exit)
 class OptimizedDualStreamManager:
     """최적화된 Front View(가로)와 Side View(세로) 관리 클래스"""
     
-    def __init__(self):
+    def __init__(self, port=8081):
         # Front view 관련 (웹캠 - 가로)
         self.front_analyzer = FrontViewAnalyzer()
         self.front_cap = None
@@ -84,13 +143,14 @@ class OptimizedDualStreamManager:
         self.front_total_frames = 0
         
         # Side view 관련 (HTTP 서버 - 세로)
+        self.side_port = port  # 포트 저장
         self.side_running = False
         self.side_frame_buffer = deque(maxlen=1)  # 단일 버퍼
         self.side_lock = threading.Lock()
         self.side_thread = None
         self.side_server_process = None
-        self.side_server_url = "http://localhost:8081/android/frame"
-        self.side_status_url = "http://localhost:8081/android/status"
+        self.side_server_url = f"http://localhost:{port}/android/frame"      # 동적 포트
+        self.side_status_url = f"http://localhost:{port}/android/status"     # 동적 포트
         self.side_fps = 0
         self.side_fps_counter = 0
         self.side_fps_start = time.time()
@@ -101,7 +161,9 @@ class OptimizedDualStreamManager:
         
         # 미리 할당된 결합 버퍼
         self.combined_buffer = np.zeros((480, 1280, 3), dtype=np.uint8)
-    
+
+        print(f"Side view 포트는 {port}입니다!")  # 포트 정보 출력
+
     def start_front_view(self):
         """웹캠 기반 Front View 시작 (최적화)"""
         if self.front_running:
@@ -171,11 +233,11 @@ class OptimizedDualStreamManager:
             return f"side_view/run.py 파일을 찾을 수 없습니다: {side_view_path}"
         
         try:
-            # 서버 프로세스 시작
+            # 서버 프로세스 시작 (동적 포트 전달)
             self.side_server_process = subprocess.Popen([
                 sys.executable, side_view_path,
                 '--host', '0.0.0.0',
-                '--port', '8081'
+                '--port', str(self.side_port)  # 동적 포트 전달
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
             # 서버 시작 대기 및 확인
@@ -189,15 +251,18 @@ class OptimizedDualStreamManager:
                     continue
             else:
                 if self.side_server_process:
+                    stdout, stderr = self.side_server_process.communicate(timeout=3)
+                    print(f"서버 stdout: {stdout.decode()}")
+                    print(f"서버 stderr: {stderr.decode()}")
                     self.side_server_process.terminate()
                     self.side_server_process = None
-                return "서버 시작 후 응답이 없습니다. 포트 8081이 사용중인지 확인하세요."
+                return f"서버 시작 후 응답이 없습니다. 포트 {self.side_port}이 사용중인지 확인하세요."
             
             self.side_running = True
             self.side_thread = threading.Thread(target=self._optimized_side_worker, daemon=True)
             self.side_thread.start()
             
-            return "Side View 서버가 성공적으로 시작되었습니다!"
+            return f"Side View 서버가 포트 {self.side_port}에서 성공적으로 시작되었습니다!"
             
         except Exception as e:
             return f"Side View 서버 시작 실패: {str(e)}"
@@ -212,8 +277,9 @@ class OptimizedDualStreamManager:
                 request_start = time.time()
                 self.side_total_frames += 1
                 
-                # 빠른 HTTP 요청 (짧은 타임아웃)
+                # 타임아웃
                 response = requests.get(self.side_server_url, timeout=0.2)
+
                 if response.status_code == 200:
                     # JPEG 바이트를 OpenCV 이미지로 변환
                     img_array = np.frombuffer(response.content, dtype=np.uint8)
@@ -231,13 +297,13 @@ class OptimizedDualStreamManager:
                             self.side_fps = 30 / elapsed if elapsed > 0 else 0
                             self.side_fps_start = time.time()
                         
-                        # 세로 방향으로 회전 (90도)
-                        frame_rotated = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                        # 480(가로) x 640(세로)
+                        frame_resized = cv2.resize(frame, (480, 640))
                         
                         # 단일 버퍼 업데이트
                         with self.side_lock:
                             self.side_frame_buffer.clear()
-                            self.side_frame_buffer.append(frame_rotated)
+                            self.side_frame_buffer.append(frame_resized)
                         
                         consecutive_errors = 0
                 
@@ -248,11 +314,12 @@ class OptimizedDualStreamManager:
                     self._create_side_error_frame()
                     time.sleep(1.0)  # 연결 실패시만 대기
             
-            # 성공시에는 바로 다음 프레임 요청 (지연 최소화)
+            # 성공/실패와 관계없이 최소 대기 시간 추가 (서버 부하 방지)
+            time.sleep(0.05)  # 300ms 대기 추가
     
     def _create_side_error_frame(self):
         """Side view 연결 실패시 에러 프레임 생성"""
-        error_frame = np.zeros((640, 480, 3), dtype=np.uint8)
+        error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
         cv2.putText(error_frame, "Side View", (150, 300), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         cv2.putText(error_frame, "Server Required", (120, 340), 
@@ -274,7 +341,16 @@ class OptimizedDualStreamManager:
     
     def get_combined_frame(self) -> np.ndarray:
         """최적화된 듀얼 프레임 합성 (버퍼 재사용)"""
-        target_h, target_w = 480, 640
+        front_h, front_w = 480, 640  # Front view: 가로형
+        side_h, side_w = 640, 480    # Side view: 세로형 
+
+        # 전체 캔버스 크기 조정 (가로 + 세로)
+        total_w = front_w + side_w   # 1120
+        total_h = max(front_h, side_h)  # 640
+
+        # 미리 할당된 버퍼 크기 조정
+        if self.combined_buffer.shape != (total_h, total_w, 3):
+            self.combined_buffer = np.zeros((total_h, total_w, 3), dtype=np.uint8)
         
         # 미리 할당된 버퍼 재사용 (메모리 할당 최소화)
         self.combined_buffer.fill(0)  # 초기화만 하고 재사용
@@ -282,33 +358,33 @@ class OptimizedDualStreamManager:
         # Front 프레임 (왼쪽)
         front_frame = self.get_front_frame()
         if front_frame is not None:
-            if front_frame.shape[:2] != (target_h, target_w):
-                left = cv2.resize(front_frame, (target_w, target_h))
+            if front_frame.shape[:2] != (front_h, front_w):
+                left = cv2.resize(front_frame, (front_w, front_h))
             else:
                 left = front_frame
-            self.combined_buffer[:, :target_w] = left
+            self.combined_buffer[:front_h, :front_w] = left
         else:
             cv2.putText(self.combined_buffer, "Front AI Loading...", (180, 240), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         
         # Side 프레임 (오른쪽)
         side_frame = self.get_side_frame()
         if side_frame is not None:
-            if side_frame.shape[:2] != (target_h, target_w):
-                right = cv2.resize(side_frame, (target_w, target_h))
+            if side_frame.shape[:2] != (side_h, side_w):
+                right = cv2.resize(side_frame, (side_w, side_h))
             else:
                 right = side_frame
-            self.combined_buffer[:, target_w:] = right
+            self.combined_buffer[:side_h, front_w:front_w+side_w] = right
         else:
-            cv2.putText(self.combined_buffer, "Side AI Loading...", (target_w + 180, 240), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            cv2.putText(self.combined_buffer, "Side AI Loading...", (front_w + 120, 320), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         
         # 라벨 및 구분선
         cv2.putText(self.combined_buffer, "Front View", (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(self.combined_buffer, "Side View", (target_w + 10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-        cv2.line(self.combined_buffer, (target_w, 0), (target_w, target_h), 
+               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(self.combined_buffer, "Side View", (front_w + 10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+        cv2.line(self.combined_buffer, (front_w, 0), (front_w, total_h), 
                 (255, 255, 255), 2)
         
         return self.combined_buffer
@@ -355,147 +431,101 @@ class OptimizedDualStreamManager:
             self.side_server_process = None
 
 @st.cache_resource
-def get_optimized_stream_manager():
+def get_optimized_stream_manager(_port):
     """최적화된 스트림 매니저 싱글톤"""
     global _global_stream_manager
     if _global_stream_manager is None:
-        _global_stream_manager = OptimizedDualStreamManager()
+        _global_stream_manager = OptimizedDualStreamManager(port=_port)
     return _global_stream_manager
 
 def main():
+    # 명령행 인자 파싱
+    args = parse_args()
+    port = args.port
+
     st.set_page_config(
         page_title="Optimized Dual Pose Analysis",
         layout="wide"
     )
+
+    # 스트리밍 상태 초기화를 맨 위로 이동
+    if 'streaming' not in st.session_state:
+        st.session_state.streaming = False
     
-    st.title("최적화된 Dual Pose Analysis Stream")
-    st.markdown("**Front View (가로)** + **Side View (세로)** 고성능 실시간 분석")
+    st.title("기본 듀얼 스트리밍")
+    st.markdown("**Front_View** + **Side_View** 실시간 스트리밍")
     
-    # 최적화된 스트림 매니저 가져오기
-    stream_manager = get_optimized_stream_manager()
-    
-    # 성능 모니터링 표시
-    fps_info = stream_manager.get_fps_info()
-    col_perf1, col_perf2, col_perf3, col_perf4 = st.columns(4)
-    
-    with col_perf1:
-        st.metric("Front FPS", f"{fps_info['front_fps']:.1f}")
-    with col_perf2:
-        st.metric("Side FPS", f"{fps_info['side_fps']:.1f}")
-    with col_perf3:
-        st.metric("실효 FPS", f"{fps_info['effective_fps']:.1f}")
-    with col_perf4:
-        latency = 1000 / fps_info['effective_fps'] if fps_info['effective_fps'] > 0 else 0
-        st.metric("지연 시간", f"{latency:.0f}ms")
+    # 최적화된 스트림 매니저 가져오기 (포트 포함)
+    stream_manager = get_optimized_stream_manager(port)
     
     # 컨트롤 패널
     st.markdown("### 제어판")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2 = st.columns(2)
     
     message_placeholder = st.empty()
     
     with col1:
-        if st.button("웹캠 시작", type="primary", use_container_width=True):
-            result = stream_manager.start_front_view()
-            if "시작됨" in result:
-                message_placeholder.success(result)
-            else:
-                message_placeholder.error(result)
+        if not st.session_state.streaming:
+            if st.button("듀얼 스트리밍 시작", type="primary", use_container_width=True, key="start_everything"):
+                # 모든 것을 한 번에 시작
+                front_result = stream_manager.start_front_view()
+                side_result = stream_manager.start_side_view()
+                
+                if "시작됨" in front_result and "성공적으로" in side_result:
+                    st.session_state.streaming = True
+                    message_placeholder.success("듀얼 스트리밍이 성공적으로 시작되었습니다!")
+                    st.rerun()
+                else:
+                    message_placeholder.error(f"시작 실패 - Front: {front_result}, Side: {side_result}")
+        else:
+            if st.button("스트리밍 정지", use_container_width=True, key="stop_everything"):
+                stream_manager.stop()
+                st.session_state.streaming = False
+                message_placeholder.warning("스트리밍 정지됨")
+                st.rerun()
     
     with col2:
-        if st.button("서버 시작", type="primary", use_container_width=True):
-            result = stream_manager.start_side_view()
-            if "성공적으로" in result:
-                message_placeholder.success(result)
-            else:
-                message_placeholder.error(result)
+        st.write(f"상태: {'실행 중' if st.session_state.streaming else '정지'}")
     
-    with col3:
-        if st.button("모두 정지", use_container_width=True):
-            stream_manager.stop()
-            message_placeholder.warning("스트리밍 정지됨")
-    
-    # 상태 표시
-    st.markdown("---")
-    status_col1, status_col2 = st.columns(2)
-    with status_col1:
-        front_status = "활성" if stream_manager.front_running else "비활성"
-        st.write(f"**Front View**: {front_status}")
-        
-    with status_col2:
-        side_status = "활성" if stream_manager.side_running else "비활성"
-        st.write(f"**Side View**: {side_status}")
-    
-    # 최적화된 듀얼 스트림 표시
-    st.markdown("### 실시간 스트림 (최적화)")
-    
-    # 스트리밍 상태 체크
-    if 'streaming' not in st.session_state:
-        st.session_state.streaming = False
-    
-    # 스트리밍 제어
-    stream_col1, stream_col2 = st.columns(2)
-    with stream_col1:
-        if not st.session_state.streaming:
-            if st.button("고성능 스트리밍 시작", type="primary", use_container_width=True):
-                st.session_state.streaming = True
-                st.rerun()
-        else:
-            if st.button("스트리밍 정지", use_container_width=True):
-                st.session_state.streaming = False
-                st.rerun()
-    
-    with stream_col2:
-        st.write(f"스트리밍 상태: {'실행 중' if st.session_state.streaming else '정지'}")
-    
-    # 최적화된 실시간 스트리밍
+    # 스트리밍 표시
     if st.session_state.streaming:
-        frame_placeholder = st.empty()
+        st.markdown("### Front_view + Side_view")
         
-        # 고성능 루프 (st.rerun() 제거, 프레임만 교체)
+        # 두 개의 컬럼으로 나누기
+        col_front, col_side = st.columns([1, 1])
+        
+        front_placeholder = col_front.empty()
+        side_placeholder = col_side.empty()
+        
+        # 실시간 스트리밍 루프
         start_time = time.time()
-        frame_count = 0
         
-        while st.session_state.streaming and (time.time() - start_time) < 600:  # 10분 제한
+        while st.session_state.streaming and (time.time() - start_time) < 600:
             loop_start = time.time()
             
-            # 최적화된 합성 프레임 가져오기
-            combined_frame = stream_manager.get_combined_frame()
-            combined_rgb = cv2.cvtColor(combined_frame, cv2.COLOR_BGR2RGB)
+            # 프레임 가져오기 및 표시
+            front_frame = stream_manager.get_front_frame()
+            side_frame = stream_manager.get_side_frame()
             
-            # 프레임만 교체 (페이지 재실행 없음)
-            frame_placeholder.image(combined_rgb, channels="RGB", use_column_width=True)
+            if front_frame is not None:
+                front_rgb = cv2.cvtColor(front_frame, cv2.COLOR_BGR2RGB)
+                front_placeholder.image(front_rgb, channels="RGB", use_container_width=True)
+            else:
+                front_placeholder.text("Front AI Loading...")
             
-            frame_count += 1
+            if side_frame is not None:
+                side_rgb = cv2.cvtColor(side_frame, cv2.COLOR_BGR2RGB)
+                side_placeholder.image(side_rgb, channels="RGB", use_container_width=True)
+            else:
+                side_placeholder.text("Side AI Loading...")
             
-            # 적응적 지연 (목표 30fps)
+            # SpinePose 처리 시간에 맞춘 지연
             loop_time = time.time() - loop_start
-            target_loop_time = 1.0 / 30  # 30fps 목표
+            target_loop_time = 0.25  # 250ms
             if loop_time < target_loop_time:
                 time.sleep(target_loop_time - loop_time)
-    
     else:
-        st.info("고성능 스트리밍이 준비되었습니다. '고성능 스트리밍 시작' 버튼을 클릭하세요.")
-        
-        with st.expander("최적화 내용"):
-            st.markdown("""
-            **성능 최적화 사항:**
-            
-            1. **st.rerun() 제거**: 페이지 전체 재실행 → 프레임만 교체
-            2. **논블로킹 AI 처리**: 처리 실패시 원본 즉시 사용
-            3. **단일 버퍼**: 다중 큐 제거로 지연 최소화
-            4. **미리 할당된 버퍼**: 매 프레임 메모리 할당 제거
-            5. **적응적 FPS**: 실제 처리 성능에 맞춘 동적 조정
-            
-            **성능 향상:**
-            - 지연 시간: 800ms → 43ms
-            - 실효 FPS: 2fps → 30fps
-            - 버퍼링 현상 대폭 감소
-            
-            **주의사항:**
-            - 고성능 모드이므로 CPU 사용량이 증가할 수 있습니다
-            - 장시간 사용시 10분마다 재시작을 권장합니다
-            """)
+        st.info("'듀얼 스트리밍 시작' 버튼을 클릭하세요.")
 
 if __name__ == "__main__":
     main()

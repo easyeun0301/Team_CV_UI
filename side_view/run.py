@@ -371,6 +371,9 @@ def render_display_frame(ctx: Context, img_bgr: np.ndarray, result: Dict[str,Any
 
     # 표시용 업스케일
     disp = cv2.resize(canvas, (WIN_W, WIN_H), interpolation=cv2.INTER_LINEAR)
+    # 여기서 server의 processed_frame에 저장
+    server.processed_frame = disp.copy()
+    
     return disp
 
 # ========= (9) 디스플레이 전용 스레드 =========
@@ -410,9 +413,9 @@ def main():
     # 모델은 단 1회 생성
     try:
         spine_est = SpinePoseEstimator(mode=args.model_size, device="cpu")
-        print(f"✓ SpinePose mode={args.model_size} loaded")
+        print(f"SpinePose mode={args.model_size} loaded")
     except Exception as e:
-        print(f"✗ SpinePose load failed: {e}")
+        print(f"SpinePose load failed: {e}")
         return
 
     mp_pose = mp.solutions.pose
