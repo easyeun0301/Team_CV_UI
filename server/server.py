@@ -83,7 +83,7 @@ HTML = """<!doctype html>
         
         const constraints = {
           video: { 
-            facingMode: "user",
+            facingMode: "environment",
             width: { ideal: 640 },
             height: { ideal: 480 },
             frameRate: { ideal: 30 }

@@ -715,120 +715,109 @@ def render_display_frame(ctx: Context, img_bgr: np.ndarray, result: Dict[str, An
                         (10, 64), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
                         thr_lumbar_color(spinal_curve, ctx.config.CURVE_THRESH_DEG), thickness, cv2.LINE_AA)
 
-    server.processed_frame = disp.copy()
-
     return disp
 
 # ========= (9) 프레임 콜백 함수 =========
 async def process_frame_callback(ctx: Context, img_bgr: np.ndarray) -> np.ndarray:
-    """프레임 수신 콜백 (표현 금지, 큐에만 삽입)"""
-    h, w = img_bgr.shape[:2]
+    """프레임 수신 콜백 - AI 처리된 프레임을 직접 반환"""
+    H, W = img_bgr.shape[:2]
 
-    # 입력 큐에 최신 프레임만 유지
-    safe_queue_put(ctx.frame_q, (img_bgr.copy(), w, h), replace_if_full=True)
-
-    # server가 갱신하는 타임스탬프를 읽기만 함 (표시용)
-    now = time.perf_counter()
-    ctx.last_recv_ts = getattr(server, 'last_recv_ts', now)
-    ctx.last_decode_ts = getattr(server, 'last_decode_ts', now)
-
-    return img_bgr  # 표현은 디스플레이 스레드에서만
+    # 프레임당 1회만 BGR->RGB (모델 공용)  -------- CHANGED 
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    
+    try:
+        # === 즉시 AI 처리 수행 ===
+        t0 = time.perf_counter()
+        
+        # ---- (A) BlazePose: ROI 계산 ----
+        now_ms = time.perf_counter() * 1000.0
+        
+        if now_ms >= ctx.next_bp_ts:
+            ctx.next_bp_ts = now_ms + ctx.config.BP_PERIOD_MS
+            
+            # 다운스케일 추론 (RGB에서 다운스케일)  ---- CHANGED
+            if 0 < ctx.infer_scale < 1.0:
+                small = cv2.resize(img_rgb, (int(W * ctx.infer_scale), int(H * ctx.infer_scale)),
+                                 interpolation=cv2.INTER_AREA)
+                sw, sh = small.shape[1], small.shape[0]
+                res = ctx.pose.process(small)
+                
+                # 좌표 스케일업 (round 후 int)  ---- CHANGED
+                if res and res.pose_landmarks:
+                    lm_px_small = lm_to_px_dict(res.pose_landmarks, sw, sh, ctx.mp_pl)
+                    lm_px = {
+                        k: (int(round(v[0] / ctx.infer_scale)),
+                            int(round(v[1] / ctx.infer_scale)),
+                            v[2])
+                        for k, v in lm_px_small.items()
+                    }
+                    raw_roi = make_side_roi_from_mp(lm_px, W, H, margin=0.10, square_pad=True, pad_ratio=0.10)
+                else:
+                    raw_roi = ctx.last_roi if ctx.last_roi else (int(W*0.2), int(H*0.2), int(W*0.8), int(H*0.8))
+            else:
+                # 원본 RGB로 BP 실행  ---- CHANGED
+                res = ctx.pose.process(img_rgb)
+                if res and res.pose_landmarks:
+                    lm_px = lm_to_px_dict(res.pose_landmarks, W, H, ctx.mp_pl)
+                    raw_roi = make_side_roi_from_mp(lm_px, W, H, margin=0.10, square_pad=True, pad_ratio=0.10)
+                else:
+                    raw_roi = ctx.last_roi if ctx.last_roi else (int(W*0.2), int(H*0.2), int(W*0.8), int(H*0.8))
+            
+            # ROI 스무딩 + 성공 시 갱신  ---- CHANGED
+            ctx.last_roi = smooth_roi(ctx.last_roi, raw_roi, alpha=0.7, max_scale_step=0.10, frame_w=W, frame_h=H)
+        
+        # ---- (B) SpinePose: 추론 ----
+        sp_kpts, sp_scores = [], [] # 기본값을 빈 리스트로 초기화
+        
+        if now_ms >= ctx.next_sp_ts:
+            ctx.next_sp_ts = now_ms + ctx.config.SP_PERIOD_MS
+            x1, y1, x2, y2 = ctx.last_roi if ctx.last_roi else (int(W*0.2), int(H*0.2), int(W*0.8), int(H*0.8))
+            bbox = [[x1, y1, x2, y2]]
+            # SpinePose에도 같은 RGB를 전달, 이중 변환 금지  ---- CHANGED
+            sp_kpts, sp_scores = spinepose_infer_any(ctx.spine_est, img_rgb, bboxes=bbox, already_rgb=True)
+        
+        # ---- (C) 결과 생성 ----- NumPy 배열 안전 검사
+        result = {
+            "sp_kpts": [(int(x), int(y)) for x, y in sp_kpts] if len(sp_kpts) > 0 else [],
+            "sp_scores": sp_scores.tolist() if hasattr(sp_scores, 'tolist') and len(sp_scores) > 0 else (sp_scores if sp_scores else []),
+            "roi": ctx.last_roi
+        }
+        
+        # sticky 갱신 - 안전한 길이 검사
+        if len(result.get("sp_kpts", [])) >= 3:
+            ctx.last_good_results.update(result)
+            ctx.last_update_ms = time.perf_counter() * 1000.0
+        
+        # ---- (D) AI 처리된 프레임 생성 및 반환 ----
+        processed_frame = render_display_frame(ctx, img_bgr, result)
+        
+        # 비동기 큐에도 저장 (display_worker용)
+        safe_queue_put(ctx.frame_q, (img_bgr.copy(), W, H), replace_if_full=True)
+        safe_queue_put(ctx.display_q, processed_frame.copy(), replace_if_full=True)
+        
+        return processed_frame  # AI 처리된 프레임 반환!!
+        
+    except Exception as e:
+        print(f"[Callback] AI processing error: {e}")
+        return img_bgr  # 에러시에만 원본 반환
 
 # ========= (10) 추론 워커 =========
 def inference_worker(ctx: Context):
-    """BlazePose/SpinePose 비동기 추론 워커"""
+    """단순화된 추론 워커 - 주로 통계용"""
     while ctx.running:
         try:
-            t0 = time.perf_counter()
-            frame = ctx.frame_q.get(timeout=1.0)
-            
-            if frame is None:
+            # 큐에서 프레임 가져오기 (통계 수집용)
+            frame_data = ctx.frame_q.get(timeout=1.0)
+            if frame_data is None:
                 break
-            
-            img_bgr, W, H = frame
-
-            # 프레임당 1회만 BGR->RGB (모델 공용)  -------- CHANGED
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-            # ---- (A) BlazePose: 주기적 ROI 갱신 ----
-            now_ms = time.perf_counter() * 1000.0
-            
-            if now_ms >= ctx.next_bp_ts:
-                ctx.next_bp_ts = now_ms + ctx.config.BP_PERIOD_MS
-
-                # 다운스케일 추론 (RGB에서 다운스케일)  ---- CHANGED
-                if 0 < ctx.infer_scale < 1.0:
-                    small = cv2.resize(img_rgb, (int(W * ctx.infer_scale), int(H * ctx.infer_scale)),
-                                     interpolation=cv2.INTER_AREA)
-                    sw, sh = small.shape[1], small.shape[0]
-                    res = ctx.pose.process(small)
-                    
-                    # 좌표 스케일업 (round 후 int)  ---- CHANGED
-                    if res and res.pose_landmarks:
-                        lm_px_small = lm_to_px_dict(res.pose_landmarks, sw, sh, ctx.mp_pl)
-                        lm_px = {
-                            k: (int(round(v[0] / ctx.infer_scale)),
-                                int(round(v[1] / ctx.infer_scale)),
-                                v[2])
-                            for k, v in lm_px_small.items()
-                        }
-                        raw_roi = make_side_roi_from_mp(lm_px, W, H, margin=0.10, square_pad=True, pad_ratio=0.10)
-                    else:
-                        raw_roi = ctx.last_roi if ctx.last_roi else (int(W*0.2), int(H*0.2), int(W*0.8), int(H*0.8))
-                else:
-                    # 원본 RGB로 BP 실행  ---- CHANGED
-                    res = ctx.pose.process(img_rgb)
-                    if res and res.pose_landmarks:
-                        lm_px = lm_to_px_dict(res.pose_landmarks, W, H, ctx.mp_pl)
-                        raw_roi = make_side_roi_from_mp(lm_px, W, H, margin=0.10, square_pad=True, pad_ratio=0.10)
-                    else:
-                        raw_roi = ctx.last_roi if ctx.last_roi else (int(W*0.2), int(H*0.2), int(W*0.8), int(H*0.8))
-
-                bp_t1 = time.perf_counter()
-                ctx.bp_hist.append(bp_t1 - t0)
-
-                # ROI 스무딩 + 성공 시 갱신  ---- CHANGED
-                ctx.last_roi = smooth_roi(ctx.last_roi, raw_roi, alpha=0.7, max_scale_step=0.10, frame_w=W, frame_h=H)
-
-            # ---- (B) SpinePose: 주기적 추론 ----
-            sp_kpts, sp_scores = [], []  # 기본값을 빈 리스트로 초기화
-            
-            if now_ms >= ctx.next_sp_ts:
-                ctx.next_sp_ts = now_ms + ctx.config.SP_PERIOD_MS
-                x1, y1, x2, y2 = ctx.last_roi if ctx.last_roi else (int(W*0.2), int(H*0.2), int(W*0.8), int(H*0.8))
-                bbox = [[x1, y1, x2, y2]]
                 
-                sp_t0 = time.perf_counter()
-                # SpinePose에도 같은 RGB를 전달, 이중 변환 금지  ---- CHANGED
-                sp_kpts, sp_scores = spinepose_infer_any(ctx.spine_est, img_rgb, bboxes=bbox, already_rgb=True)
-                sp_t1 = time.perf_counter()
-                ctx.sp_hist.append(sp_t1 - sp_t0)
-
-            t1 = time.perf_counter()
-            ctx.e2e_hist.append(t1 - t0)
-
-            # 결과 생성 - NumPy 배열 안전 검사
-            result = {
-                "sp_kpts": [(int(x), int(y)) for x, y in sp_kpts] if len(sp_kpts) > 0 else [],
-                "sp_scores": sp_scores.tolist() if hasattr(sp_scores, 'tolist') and len(sp_scores) > 0 else (sp_scores if sp_scores else []),
-                "roi": ctx.last_roi
-            }
-            
-            # 결과 큐에 최신 결과만 유지
-            safe_queue_put(ctx.result_q, result, replace_if_full=True)
-
-            # sticky 갱신 - 안전한 길이 검사
+            # 큐에서 처리된 프레임 가져오기
             try:
-                if len(result.get("sp_kpts", [])) >= 3:
-                    ctx.last_good_results.update(result)
-                    ctx.last_update_ms = time.perf_counter() * 1000.0
-            except Exception:
+                disp = ctx.display_q.get_nowait()
+                # 별도 처리 없이 그대로 유지
+            except queue.Empty:
                 pass
-
-            # 디스플레이용 프레임 생성 (원본 BGR 위에 오버레이)
-            disp = render_display_frame(ctx, img_bgr, result)
-            safe_queue_put(ctx.display_q, disp, replace_if_full=True)
-
+                
         except queue.Empty:
             continue
         except Exception as e:

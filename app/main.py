@@ -315,7 +315,7 @@ class OptimizedDualStreamManager:
                     time.sleep(1.0)  # 연결 실패시만 대기
             
             # 성공/실패와 관계없이 최소 대기 시간 추가 (서버 부하 방지)
-            time.sleep(0.05)  # 300ms 대기 추가
+            time.sleep(0.15)  # spinepose 처리 주기인 140ms에 맞춰서 150ms 대기 - 0928
     
     def _create_side_error_frame(self):
         """Side view 연결 실패시 에러 프레임 생성"""
