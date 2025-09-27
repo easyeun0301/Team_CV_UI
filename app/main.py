@@ -521,7 +521,7 @@ def main():
             
             # SpinePose 처리 시간에 맞춘 지연
             loop_time = time.time() - loop_start
-            target_loop_time = 0.25  # 250ms
+            target_loop_time = 0.15  # 250ms
             if loop_time < target_loop_time:
                 time.sleep(target_loop_time - loop_time)
     else:
