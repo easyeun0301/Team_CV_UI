@@ -33,7 +33,7 @@ class FrontViewAnalyzer:
         # 설정값 (원 코드 기반)
         self.BASE_EAR_THRESHOLD = 0.20
         self.BLINK_THRESHOLD_PER_WIN = 20
-        self.BLINK_WINDOW_SEC = 300
+        self.BLINK_WINDOW_SEC = 60
         self.MIN_OPEN_FRAMES = 1
 
         # 정면 수평 판단 임계값
@@ -429,7 +429,7 @@ class FrontViewAnalyzer:
                 y += line_heights[i + 1] + 6
 
 
-
+    '''
     def _draw_hud(self, image, extra=None, anchor='br'):
         # 1) 표시할 토큰(항목) 준비
         tokens = [
@@ -473,7 +473,7 @@ class FrontViewAnalyzer:
 
         # 3) 우하단 패널로 렌더 (한 줄에 여러 항목씩 표시)
         self._draw_panel(image, lines, anchor=anchor, margin=60, alpha=0.35)
-
+    '''
     def _begin_overlay(self, base_img):
         """선/점 그리기용 오버레이 버퍼 시작"""
         self._overlay_buf = base_img.copy()
@@ -681,9 +681,16 @@ class FrontViewAnalyzer:
             pass_flag = (self.blink_count >= self.BLINK_THRESHOLD_PER_WIN)
             msg = f"Blink {self.blink_count}/{self.BLINK_THRESHOLD_PER_WIN} (remain {remain}s)"
             self.metrics_lines.append((msg, (0, 220, 0) if pass_flag else (255, 255, 0)))
+        bottom_h = 240  # 아래 여백 높이(필요시 160~240 사이로 튜닝)
+        canvas = np.zeros((h + bottom_h, w, 3), dtype=np.uint8)
+        # 상단에 원본 프레임 붙이기
+        canvas[:h, :w] = image
 
+        self._draw_panel(image, self.metrics_lines, anchor='tl', margin=18, alpha=0.35)    
         self._flush_overlay(image)
 
+        return image
+    '''
         # --- HUD 표시용 라인 구성 ---
         extra = [
             f"Blink  : {self.blink_count}",
@@ -705,13 +712,11 @@ class FrontViewAnalyzer:
         # 좌상단: 지표 패널
         self._draw_panel(canvas, self.metrics_lines, anchor='tl', margin=18, alpha=0.35)
         # 우하단: HUD
-        self._draw_hud(canvas, extra=extra, anchor='br')
-
-        return canvas
-
-
-
-'''# 테스트용 메인함수
+       # self._draw_hud(canvas, extra=extra, anchor='br')
+    '''
+    
+'''
+# 테스트용 메인함수
 if __name__ == "__main__":
     cap = cv2.VideoCapture(0)
     # (선택) 빠른 깜빡임 포착에 도움: 장치가 지원할 경우만 반영됨
